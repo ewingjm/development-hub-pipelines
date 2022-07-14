@@ -1,0 +1,32 @@
+name: Delete environment $(DevelopmentHub.ExtractEnvironment.RecordId)
+
+trigger: none
+
+pool:
+  vmImage: windows-latest
+
+variables:
+  - group: Development Hub
+  - name: BuildTools.EnvironmentUrl
+    value: $[ variables['DevelopmentHub.ExtractEnvironment.Url'] ]
+
+steps:
+  - task: PowerPlatformToolInstaller@0
+    displayName: Install Power Platform Build Tools
+  - task: PowerPlatformDeleteEnvironment@0
+    displayName: Delete the environment
+    inputs:
+      authenticationType: PowerPlatformSPN
+      PowerPlatformSPN: Development Hub
+  - task: PowerShell@2
+    displayName: Set environment status to deleted
+    inputs:
+      targetType: filePath
+      filePath: scripts/Set-DevHubEnvironmentStatus.ps1
+      arguments: >
+        -EnvironmentId $env:DEVELOPMENTHUB_EXTRACTENVIRONMENT_RECORDID
+        -Status Deleted
+        -Url $env:DEVELOPMENTHUB_DEVELOPMENTENVIRONMENT_URL
+    env:
+      DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+      

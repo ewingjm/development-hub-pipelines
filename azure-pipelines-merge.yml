@@ -1,0 +1,438 @@
+name: Merge $(DevelopmentHub.Issue.Name)
+
+trigger: none
+
+parameters:
+  - name: manualMergeActivities
+    displayName: Manual merge activities
+    type: boolean
+  - name: sourceControlStrategy
+    displayName: Source control strategy
+    type: string
+    values:
+      - Push
+      - Pull request
+  - name: sourceBranch
+    displayName: Source branch
+    type: string
+    default: ' '
+
+pool:
+  vmImage: windows-latest
+
+variables:
+  - group: Development Hub
+  # Unique names for each inline checkout for the same repository are required due to a bug in Azure Pipelines.
+  - name: DevelopmentHub.TargetSolution.Repository1
+    value: $[ variables['DevelopmentHub.TargetSolution.Repository'] ]
+  - name: DevelopmentHub.TargetSolution.Repository2
+    value: $[ variables['DevelopmentHub.TargetSolution.Repository'] ]
+
+jobs:
+  - job: SetStatusToMerging
+    displayName: Set status to merging
+    steps:
+      - task: PowerShell@2
+        displayName: Set solution merge status
+        inputs:
+          targetType: filePath
+          filePath: scripts/Set-DevHubSolutionMergeStatus.ps1
+          arguments: >
+            -SolutionMergeId $env:DEVELOPMENTHUB_SOLUTIONMERGE_RECORDID
+            -Status Merging
+            -Url $env:DEVELOPMENTHUB_DEVELOPMENTENVIRONMENT_URL
+        env:
+          DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+  - job: ExportDevelopmentSolution
+    displayName: Export development solution
+    dependsOn: SetStatusToMerging
+    variables:
+      - name: BuildTools.EnvironmentUrl
+        value: $(DevelopmentHub.DevelopmentEnvironment.Url)
+    steps:
+      - checkout: none
+      - task: PowerPlatformToolInstaller@0
+        displayName: Install Power Platform Build Tools
+        inputs:
+          DefaultVersion: true
+      - task: PowerPlatformExportSolution@0
+        displayName: Export $(DevelopmentHub.Issue.DevelopmentSolution)
+        inputs:
+          SolutionName: $(DevelopmentHub.Issue.DevelopmentSolution)
+          Managed: false
+          authenticationType: PowerPlatformSPN
+          PowerPlatformSPN: Development Hub
+          AsyncOperation: true
+          MaxAsyncWaitTime: 1200
+          SolutionOutputFile: $(Build.ArtifactStagingDirectory)/$(DevelopmentHub.Issue.DevelopmentSolution).zip
+      - publish: $(Build.ArtifactStagingDirectory)/$(DevelopmentHub.Issue.DevelopmentSolution).zip
+        artifact: DevelopmentSolution
+        displayName: Publish solution artifact
+  - job: ImportDevelopmentSolution
+    displayName: Import development solution
+    dependsOn: ExportDevelopmentSolution
+    variables:
+      - name: BuildTools.EnvironmentUrl
+        value: $(DevelopmentHub.ExtractEnvironment.Url)
+    steps:
+      - download: current
+        artifact: DevelopmentSolution
+      - task: PowerPlatformToolInstaller@0
+        displayName: Install Power Platform Build Tools
+        inputs:
+          DefaultVersion: true
+      - task: PowerPlatformImportSolution@0
+        displayName: Import solution
+        inputs:
+          SolutionInputFile: $(Pipeline.Workspace)/DevelopmentSolution/$(DevelopmentHub.Issue.DevelopmentSolution).zip
+          authenticationType: PowerPlatformSPN
+          PowerPlatformSPN: Development Hub
+          AsyncOperation: true
+          MaxAsyncWaitTime: 1200
+      - task: PowerShell@2
+        displayName: Publish customisations
+        inputs:
+          targetType: filePath
+          filePath: scripts/Publish-Customisations.ps1
+          arguments: >
+            -Url $env:DEVELOPMENTHUB_EXTRACTENVIRONMENT_URL
+        env:
+          DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+      # TODO: Use this task again when time to publish is reduced
+      # - task: PowerPlatformPublishCustomizations@0
+      #   displayName: Publish customisations
+      #   inputs:
+      #     authenticationType: PowerPlatformSPN
+      #     PowerPlatformSPN: Development Hub
+  - job: CopySolutionComponents
+    displayName: Copy solution components
+    dependsOn: ImportDevelopmentSolution
+    steps:
+      - task: PowerShell@2
+        displayName: Copy solution components
+        inputs:
+          targetType: filePath
+          filePath: scripts/Copy-DataverseSolutionComponents.ps1
+          arguments: >
+            -Url $env:DEVELOPMENTHUB_EXTRACTENVIRONMENT_URL
+            -Source $env:DEVELOPMENTHUB_ISSUE_DEVELOPMENTSOLUTION
+            -Target $env:DEVELOPMENTHUB_TARGETSOLUTION_NAME
+            -TargetDisplayName $env:DEVELOPMENTHUB_TARGETSOLUTION_DISPLAYNAME
+            -TargetDescription $env:DEVELOPMENTHUB_TARGETSOLUTION_DESCRIPTION
+        env:
+          DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+  - job: SetSolutionVersion
+    displayName: Set solution version
+    dependsOn: CopySolutionComponents
+    condition: and(succeeded(), ne(variables['DevelopmentHub.TargetSolution.Version'],''))
+    variables:
+      - name: BuildTools.EnvironmentUrl
+        value: $(DevelopmentHub.ExtractEnvironment.Url)
+    steps:
+      - checkout: none
+      - task: PowerPlatformToolInstaller@0
+        displayName: Install Power Platform Build Tools
+        inputs:
+          DefaultVersion: true
+      - task: PowerPlatformSetSolutionVersion@0
+        displayName: Set solution version
+        inputs:
+          authenticationType: PowerPlatformSPN
+          PowerPlatformSPN: Development Hub
+          SolutionName: $(DevelopmentHub.TargetSolution.Name)
+          SolutionVersionNumber: $(DevelopmentHub.TargetSolution.Version)
+  - ${{ if parameters.manualMergeActivities }}:
+    - job: SetStatusToAwaitingManualMerge
+      displayName: Set status to awaiting manual merge
+      dependsOn: 
+        - CopySolutionComponents
+        - SetSolutionVersion
+      condition: and(eq(dependencies.CopySolutionComponents.result, 'Succeeded'), in(dependencies.SetSolutionVersion.result, 'Succeeded', 'Skipped'))
+      steps:
+        - task: PowerShell@2
+          displayName: Grant access to solution merge creator
+          inputs:
+            targetType: filePath
+            filePath: scripts/New-DataverseAdminUser.ps1
+            arguments: >
+              -EnvironmentUrl $env:DEVELOPMENTHUB_EXTRACTENVIRONMENT_URL
+              -PrincipalObjectId $env:DEVELOPMENTHUB_SOLUTIONMERGE_CREATOROBJECTID
+          env:
+            DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+        - task: PowerShell@2
+          displayName: Grant access to solution merge approver
+          inputs:
+            targetType: filePath
+            filePath: scripts/New-DataverseAdminUser.ps1
+            arguments: >
+              -EnvironmentUrl $env:DEVELOPMENTHUB_EXTRACTENVIRONMENT_URL
+              -PrincipalObjectId $env:DEVELOPMENTHUB_SOLUTIONMERGE_APPROVEROBJECTID
+          env:
+            DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+        - task: PowerShell@2
+          displayName: Set solution merge status
+          inputs:
+            targetType: filePath
+            filePath: scripts/Set-DevHubSolutionMergeStatus.ps1
+            arguments: >
+              -SolutionMergeId $env:DEVELOPMENTHUB_SOLUTIONMERGE_RECORDID
+              -Status AwaitingManualMerge
+              -Url $env:DEVELOPMENTHUB_DEVELOPMENTENVIRONMENT_URL
+          env:
+            DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+    - job: ManualMergeActivities
+      displayName: Manual merge activities
+      dependsOn: SetStatusToAwaitingManualMerge
+      condition: succeeded('SetStatusToAwaitingManualMerge')
+      pool: server
+      timeoutInMinutes: 8640
+      steps:
+        - task: ManualValidation@0
+          displayName: Wait for manual validation
+          timeoutInMinutes: 7200
+          inputs:
+            onTimeout: resume
+            instructions: 'Resume when the manual merge has completed or reject to cancel.'
+  - job: ExportTargetSolution
+    displayName: Export target solution
+    dependsOn: 
+      - ${{ if parameters.manualMergeActivities }}:
+        - ManualMergeActivities
+      - CopySolutionComponents
+    condition: and(not(canceled()), not(failed()))
+    variables:
+      - name: BuildTools.EnvironmentUrl
+        value: $(DevelopmentHub.ExtractEnvironment.Url)
+    steps:
+      - checkout: none
+      - task: PowerPlatformToolInstaller@0
+        displayName: Install Power Platform Build Tools
+        inputs:
+          DefaultVersion: true
+      - task: PowerPlatformExportSolution@0
+        displayName: Export managed $(DevelopmentHub.TargetSolution.Name)
+        inputs:
+          SolutionName: $(DevelopmentHub.TargetSolution.Name)
+          Managed: false
+          authenticationType: PowerPlatformSPN
+          PowerPlatformSPN: Development Hub
+          AsyncOperation: true
+          MaxAsyncWaitTime: 1800
+          SolutionOutputFile: $(Build.ArtifactStagingDirectory)/Solution/$(DevelopmentHub.TargetSolution.Name).zip
+      - task: PowerPlatformExportSolution@0
+        displayName: Export unmanaged $(DevelopmentHub.TargetSolution.Name)
+        inputs:
+          SolutionName: $(DevelopmentHub.TargetSolution.Name)
+          Managed: true
+          authenticationType: PowerPlatformSPN
+          PowerPlatformSPN: Development Hub
+          AsyncOperation: true
+          MaxAsyncWaitTime: 1800
+          SolutionOutputFile: $(Build.ArtifactStagingDirectory)/Solution/$(DevelopmentHub.TargetSolution.Name)_managed.zip
+      - publish: $(Build.ArtifactStagingDirectory)/Solution
+        artifact: Solution
+        displayName: Publish solution artifact
+      - task: PowerPlatformDeleteSolution@0
+        displayName: Delete development solution
+        inputs:
+          authenticationType: PowerPlatformSPN
+          PowerPlatformSPN: Development Hub
+          SolutionName: $(DevelopmentHub.Issue.DevelopmentSolution)
+  - job: Commit
+    displayName: Commit
+    dependsOn: ExportTargetSolution
+    condition: and(not(canceled()), not(failed()))
+    variables:
+      DevelopmentHub.TargetSolution.SourceFolder: ''
+      DevelopmentHub.SolutionMerge.BranchName: ''
+      DevelopmentHub.Repository.SolutionRoot: src/solutions
+      DevelopmentHub.Repository.MetadataRoot: src
+    steps:
+      - checkout: self
+      - checkout: git://$(System.TeamProject)/$(DevelopmentHub.TargetSolution.Repository)
+        persistCredentials: true
+      - powershell: Write-Host "##vso[task.setvariable variable=DevelopmentHub.TargetSolution.SourceFolder;]$([IO.Path]::Combine($env:BUILD_SOURCESDIRECTORY, $env:DEVELOPMENTHUB_TARGETSOLUTION_REPOSITORY, $env:DEVELOPMENTHUB_REPOSITORY_SOLUTIONROOT, $env:DEVELOPMENTHUB_TARGETSOLUTION_NAME))"
+        displayName: Get solution source folder
+      - task: PowerShell@2
+        displayName: Create or switch to solution merge branch
+        inputs:
+          targetType: filePath
+          filePath: $(Build.SourcesDirectory)/$(Build.Repository.Name)/scripts/Set-GitSolutionMergeBranch.ps1
+          arguments: >
+            -IssueType $env:DEVELOPMENTHUB_ISSUE_TYPE
+            -IssueName $env:DEVELOPMENTHUB_ISSUE_NAME
+            -SourceFolder $env:DEVELOPMENTHUB_TARGETSOLUTION_SOURCEFOLDER
+            -CommitHash $env:DEVELOPMENTHUB_EXTRACTENVIRONMENT_COMMITHASH
+            -TargetBranch $env:DEVELOPMENTHUB_REPOSITORY_TARGETBRANCH
+          workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+        name: getSolutionMergeBranch
+      - powershell: |
+          git config user.name $env:DEVELOPMENTHUB_SOLUTIONMERGE_CREATOR
+          git config user.email $env:DEVELOPMENTHUB_SOLUTIONMERGE_CREATOREMAIL
+        displayName: Set Git identity to $(DevelopmentHub.SolutionMerge.CreatorEmail)
+        workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+      - ${{ if replace(parameters.sourceBranch, ' ', '') }}:
+        - task: PowerShell@2
+          displayName: Merge $(DevelopmentHub.SolutionMerge.SourceBranch)
+          inputs:
+            targetType: filePath
+            filePath: $(Build.SourcesDirectory)/$(Build.Repository.Name)/scripts/Merge-GitSolutionMergeSourceBranch.ps1
+            arguments: >
+              -Source "origin/$env:DEVELOPMENTHUB_SOLUTIONMERGE_SOURCEBRANCH"
+              -SolutionRoot $env:DEVELOPMENTHUB_REPOSITORY_SOLUTIONROOT 
+              -MetadatRoot$env:DEVELOPMENTHUB_REPOSITORY_METADATAROOT
+            workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+      - powershell: md -Force (Join-Path $env:DEVELOPMENTHUB_TARGETSOLUTION_SOURCEFOLDER $env:DEVELOPMENTHUB_REPOSITORY_METADATAROOT) | Out-Null
+        displayName: Ensure metadata folder exists
+        workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+      - task: DeleteFiles@1
+        displayName: Delete any existing extacted files
+        inputs:
+          Contents: "**/*"
+          RemoveSourceFolder: false
+          SourceFolder: $(DevelopmentHub.TargetSolution.SourceFolder)/$(DevelopmentHub.Repository.MetadataRoot)
+      - download: current
+        artifact: Solution
+      - task: PowerPlatformToolInstaller@0
+        displayName: Install Power Platform Build Tools
+        inputs:
+          DefaultVersion: true
+      - task: PowerShell@2
+        displayName: Unpack solution
+        inputs:
+          targetType: filePath
+          filePath: $(Build.SourcesDirectory)/$(Build.Repository.Name)/scripts/Invoke-SolutionPackagerExtract.ps1
+          arguments: >
+            -Solution $env:SolutionInputFile 
+            -TargetFolder $env:SolutionTargetFolder 
+            -Type Both
+            -MappingFileRoot $env:DEVELOPMENTHUB_TARGETSOLUTION_SOURCEFOLDER
+        env:
+          SolutionInputFile: $(Pipeline.Workspace)/Solution/$(DevelopmentHub.TargetSolution.Name).zip
+          SolutionTargetFolder: $(DevelopmentHub.TargetSolution.SourceFolder)/$(DevelopmentHub.Repository.MetadataRoot)
+      - powershell: git add ([IO.Path]::Combine($env:DEVELOPMENTHUB_REPOSITORY_SOLUTIONROOT, "*", $env:DEVELOPMENTHUB_REPOSITORY_METADATAROOT, "*"))
+        displayName: Stage extracted solution metadata
+        workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+      - task: PowerShell@2
+        displayName: Commit
+        inputs:
+          targetType: filePath
+          filePath: $(Build.SourcesDirectory)/$(Build.Repository.Name)/scripts/New-GitSolutionMergeCommit.ps1
+          arguments: >
+            -SolutionMergeId $env:DEVELOPMENTHUB_SOLUTIONMERGE_RECORDID
+            -SolutionMergeCreator $env:DEVELOPMENTHUB_SOLUTIONMERGE_CREATOR
+            -SolutionMergeCreatorEmail $env:DEVELOPMENTHUB_SOLUTIONMERGE_CREATOREMAIL
+            -IssueType $env:DEVELOPMENTHUB_ISSUE_TYPE
+            -IssueName $env:DEVELOPMENTHUB_ISSUE_NAME
+            -IssueWorkItemId $env:DEVELOPMENTHUB_ISSUE_WORKITEMID
+          workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+      - powershell: |
+          git push -u origin $env:DEVELOPMENTHUB_SOLUTIONMERGE_BRANCHNAME
+        displayName: Publish solution merge branch
+        workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+  - ${{ if eq(parameters.sourceControlStrategy, 'Push') }}:
+    - job: Push
+      displayName: Push
+      dependsOn: Commit
+      condition: and(not(canceled()), not(failed()))
+      variables:
+        DevelopmentHub.SolutionMerge.BranchName: $[ dependencies.Commit.outputs['getSolutionMergeBranch.branchName'] ]
+      steps:
+        - checkout: git://$(System.TeamProject)/$(DevelopmentHub.TargetSolution.Repository1)
+          persistCredentials: true
+        - powershell: git checkout $env:DEVELOPMENTHUB_SOLUTIONMERGE_BRANCHNAME
+          displayName: Checkout $(DevelopmentHub.SolutionMerge.BranchName)
+        - powershell: git push origin $env:DEVELOPMENTHUB_REPOSITORY_TARGETBRANCH
+          displayName: Push to $(DevelopmentHub.Repository.TargetBranch)
+        - powershell: git push -d origin $env:DEVELOPMENTHUB_SOLUTIONMERGE_BRANCHNAME
+          displayName: Delete $(DevelopmentHub.SolutionMerge.BranchName)
+  - ${{ if eq(parameters.sourceControlStrategy, 'Pull request') }}:
+    - job: CreatePullRequest
+      displayName: Create pull request
+      dependsOn: Commit
+      condition: and(not(canceled()), not(failed()))
+      variables:
+        DevelopmentHub.SolutionMerge.BranchName: $[ dependencies.Commit.outputs['getSolutionMergeBranch.branchName'] ]
+        DevelopmentHub.PullRequest.Exists: false
+      steps:
+        - checkout: self
+        - checkout: git://$(System.TeamProject)/$(DevelopmentHub.TargetSolution.Repository2)
+          persistCredentials: true
+        - powershell: git checkout $env:DEVELOPMENTHUB_SOLUTIONMERGE_BRANCHNAME
+          displayName: Checkout $(DevelopmentHub.SolutionMerge.BranchName)
+          workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+        - powershell: |
+            $pullRequests = az repos pr list `
+              --org $env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI `
+              -p $env:SYSTEM_TEAMPROJECT `
+              --repository $env:DEVELOPMENTHUB_TARGETSOLUTION_REPOSITORY `
+              -s $env:DEVELOPMENTHUB_SOLUTIONMERGE_BRANCHNAME `
+              -t $env:DEVELOPMENTHUB_REPOSITORY_TARGETBRANCH | ConvertFrom-Json
+            
+            if ($pullRequests.Length -gt 0) { 
+              Write-Host "##vso[task.setvariable variable=DevelopmentHub.PullRequest.Exists;]true"
+              Write-Host "##vso[task.setvariable variable=DevelopmentHub.PullRequest.Id;]$($pullRequests[0].pullRequestId)"
+            }
+          displayName: Check if pull request exists
+          env:
+            AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+          workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+        - powershell: |
+            $title = git show -s --format=%s
+            $description = git show -s --format=%b
+            
+            if (![Boolean]::Parse($env:DEVELOPMENTHUB_PULLREQUEST_EXISTS)) {
+              az repos pr create `
+                --org $env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI `
+                -p $env:SYSTEM_TEAMPROJECT `
+                --repository $env:DEVELOPMENTHUB_TARGETSOLUTION_REPOSITORY `
+                -s "refs/heads/$env:DEVELOPMENTHUB_SOLUTIONMERGE_BRANCHNAME" `
+                -t "refs/heads/$env:DEVELOPMENTHUB_REPOSITORY_TARGETBRANCH" `
+                --delete-source-branch true `
+                --squash true `
+                --title $title `
+                -d $description `
+                --work-items $env:DEVELOPMENTHUB_ISSUE_WORKITEMID | Out-Null
+            }
+            else {
+              az repos pr update `
+                --org $env:SYSTEM_TEAMFOUNDATIONCOLLECTIONURI `
+                --id $env:DEVELOPMENTHUB_PULLREQUEST_ID `
+                -d $description | Out-Null
+            }
+            
+          workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
+          displayName: Create pull request
+          env:
+            AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+        - task: PowerShell@2
+          displayName: Set status to awaiting PR merge
+          inputs:
+            targetType: filePath
+            filePath: $(Build.SourcesDirectory)/$(Build.Repository.Name)/scripts/Set-DevHubSolutionMergeStatus.ps1
+            arguments: >
+              -SolutionMergeId $env:DEVELOPMENTHUB_SOLUTIONMERGE_RECORDID
+              -Status AwaitingPRMerge
+              -Url $env:DEVELOPMENTHUB_DEVELOPMENTENVIRONMENT_URL
+          env:
+            DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
+  - job: SetFailedStatus
+    displayName: Set status to failed
+    dependsOn: 
+      - ${{ if eq(parameters.sourceControlStrategy, 'Push') }}:
+        - Push
+      - ${{ if eq(parameters.sourceControlStrategy, 'Pull request') }}:
+        - CreatePullRequest
+    condition: failed()
+    steps:
+      - task: PowerShell@2
+        displayName: Set solution merge status
+        inputs:
+          targetType: filePath
+          filePath: scripts/Set-DevHubSolutionMergeStatus.ps1
+          arguments: >
+            -SolutionMergeId $env:DEVELOPMENTHUB_SOLUTIONMERGE_RECORDID
+            -Status Failed
+            -Url $env:DEVELOPMENTHUB_DEVELOPMENTENVIRONMENT_URL
+        env:
+          DEVELOPMENTHUB_APPLICATION_CLIENTSECRET: $(DevelopmentHub.Application.ClientSecret)
