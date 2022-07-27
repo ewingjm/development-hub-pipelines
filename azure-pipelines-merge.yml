@@ -280,7 +280,7 @@ jobs:
             arguments: >
               -Source "origin/$env:DEVELOPMENTHUB_SOLUTIONMERGE_SOURCEBRANCH"
               -SolutionRoot $env:DEVELOPMENTHUB_REPOSITORY_SOLUTIONROOT 
-              -MetadatRoot$env:DEVELOPMENTHUB_REPOSITORY_METADATAROOT
+              -MetadataRoot $env:DEVELOPMENTHUB_REPOSITORY_METADATAROOT
             workingDirectory: $(Build.SourcesDirectory)/$(DevelopmentHub.TargetSolution.Repository)
       - powershell: md -Force (Join-Path $env:DEVELOPMENTHUB_TARGETSOLUTION_SOURCEFOLDER $env:DEVELOPMENTHUB_REPOSITORY_METADATAROOT) | Out-Null
         displayName: Ensure metadata folder exists
